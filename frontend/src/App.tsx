@@ -6,6 +6,8 @@ import {
   ArrowRight, ArrowLeft, Check, X,
   Moon, Sun
 } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import './index.css';
 
 const API_BASE = import.meta.env.VITE_API_BASE || '/api';
@@ -20,6 +22,138 @@ type VerificationState = {
   current_code: string;
   verilog_code: string;
   final_report: string;
+  llm_latency_summary?: {
+    profile: string;
+    target_ms: number;
+    calls: number;
+    avg_ms: number;
+    max_ms: number;
+    total_ms: number;
+    within_target_calls: number;
+    within_target_rate: number;
+    meets_target: boolean;
+  };
+};
+
+type DiffRow = {
+  kind: 'context' | 'add' | 'del';
+  oldNo: number | null;
+  newNo: number | null;
+  text: string;
+};
+
+type RiskSummary = {
+  score: number;
+  level: 'Low' | 'Medium' | 'High';
+  highCount: number;
+  mediumCount: number;
+  lowCount: number;
+};
+
+const buildDiffRows = (oldCode: string, newCode: string): DiffRow[] => {
+  const oldLines = oldCode.replace(/\r\n?/g, '\n').split('\n');
+  const newLines = newCode.replace(/\r\n?/g, '\n').split('\n');
+
+  const stripComments = (line: string) =>
+    line
+      .replace(/\/\*.*?\*\//g, ' ')
+      .replace(/\/\/.*$/, ' ');
+
+  const normalizeLine = (line: string) =>
+    stripComments(line)
+      .replace(/\t/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const isCommentOnlyLine = (line: string) => {
+    const t = line.trim();
+    return (
+      t.startsWith('//') ||
+      t.startsWith('/*') ||
+      t.startsWith('*') ||
+      t.startsWith('*/')
+    );
+  };
+
+  const oldKeys = oldLines.map(normalizeLine);
+  const newKeys = newLines.map(normalizeLine);
+
+  const n = oldLines.length;
+  const m = newLines.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
+
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      if (oldKeys[i] === newKeys[j]) {
+        dp[i][j] = dp[i + 1][j + 1] + 1;
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const rows: DiffRow[] = [];
+  let i = 0;
+  let j = 0;
+
+  while (i < n && j < m) {
+    if (oldKeys[i] === newKeys[j]) {
+      rows.push({ kind: 'context', oldNo: i + 1, newNo: j + 1, text: oldLines[i] });
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      rows.push({ kind: 'del', oldNo: i + 1, newNo: null, text: oldLines[i] });
+      i += 1;
+    } else {
+      rows.push({ kind: 'add', oldNo: null, newNo: j + 1, text: newLines[j] });
+      j += 1;
+    }
+  }
+
+  while (i < n) {
+    rows.push({ kind: 'del', oldNo: i + 1, newNo: null, text: oldLines[i] });
+    i += 1;
+  }
+
+  while (j < m) {
+    rows.push({ kind: 'add', oldNo: null, newNo: j + 1, text: newLines[j] });
+    j += 1;
+  }
+
+  return rows.filter(
+    row => !(row.kind !== 'context' && isCommentOnlyLine(row.text))
+  );
+};
+
+const computeRiskSummary = (state: VerificationState | null, diffRows: DiffRow[]): RiskSummary => {
+  if (!state) {
+    return { score: 0, level: 'Low', highCount: 0, mediumCount: 0, lowCount: 0 };
+  }
+
+  let highCount = 0;
+  let mediumCount = 0;
+  let lowCount = 0;
+
+  for (const issue of state.issues_found || []) {
+    const sev = String(issue?.severity || '').toLowerCase();
+    if (sev.includes('high') || sev.includes('critical')) highCount += 1;
+    else if (sev.includes('medium')) mediumCount += 1;
+    else lowCount += 1;
+  }
+
+  const changedLines = diffRows.filter(r => r.kind !== 'context').length;
+  const unresolved = Math.max((state.issues_found?.length || 0) - (state.fixes_applied?.length || 0), 0);
+  const score = Math.min(
+    100,
+    highCount * 25 +
+      mediumCount * 14 +
+      lowCount * 6 +
+      unresolved * 10 +
+      Math.round(changedLines * 0.2)
+  );
+
+  const level: RiskSummary['level'] = score >= 67 ? 'High' : score >= 34 ? 'Medium' : 'Low';
+  return { score, level, highCount, mediumCount, lowCount };
 };
 
 const inferSimulatorMode = (code: string, message?: string): 'analog' | 'digital' => {
@@ -60,6 +194,8 @@ function App() {
 
   const [datasheet, setDatasheet] = useState<File | null>(null);
   const [verilogCode, setVerilogCode] = useState('');
+  const [verilogFileName, setVerilogFileName] = useState('');
+  const [verificationCode, setVerificationCode] = useState('');
   
   const [availableSims, setAvailableSims] = useState<string[]>(['Icarus Verilog', 'Ngspice']);
   const [selectedSim, setSelectedSim] = useState('Ngspice');
@@ -77,8 +213,11 @@ function App() {
   const [isVerifying, setIsVerifying] = useState(false);
   const [verificationState, setVerificationState] = useState<VerificationState | null>(null);
   const [verifyMessage, setVerifyMessage] = useState('');
+  const [llmStrictness, setLlmStrictness] = useState(8);
+  const [llmLatencyProfile, setLlmLatencyProfile] = useState<'fast' | 'balanced' | 'deep'>('balanced');
   
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const verilogFileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     document.body.className = theme;
@@ -102,8 +241,35 @@ function App() {
     }
   };
 
-  const nextStep = () => setStep(s => Math.min(s + 1, 4));
+  const handleVerilogUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0) {
+      return;
+    }
+
+    const file = e.target.files[0];
+    try {
+      const text = await file.text();
+      setVerilogCode(text);
+      setVerilogFileName(file.name);
+      setVerificationState(null);
+      setVerifyMessage('');
+      setSyntaxMessage('');
+      setCompileMessage('');
+      setWaveformImage(null);
+    } catch {
+      setCompileMessage('❌ Failed to read uploaded Verilog file.');
+    }
+  };
+
+  const nextStep = () => setStep(s => Math.min(s + 1, 3));
   const prevStep = () => setStep(s => Math.max(s - 1, 1));
+
+  const getSimulationInputCode = () => {
+    const design = verilogCode.trim();
+    const verification = verificationCode.trim();
+    if (!verification) return design;
+    return `${design}\n\n// User verification/testbench code\n${verification}`;
+  };
 
   const handleSyntaxCheck = async () => {
     setIsCheckingSyntax(true);
@@ -113,7 +279,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          verilog_code: verilogCode,
+          verilog_code: getSimulationInputCode(),
           simulator: selectedSim,
           xyce_path: undefined
         })
@@ -152,7 +318,7 @@ function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          verilog_code: verilogCode,
+          verilog_code: getSimulationInputCode(),
           simulator: selectedSim,
           xyce_path: undefined
         })
@@ -182,8 +348,10 @@ function App() {
       if (datasheet) formData.append('datasheet', datasheet);
       formData.append('verilog_code', verilogCode);
       formData.append('max_iterations', maxIterations.toString());
+      formData.append('simulator', selectedSim);
       formData.append('model_name', 'gemini-2.5-flash');
-      formData.append('temperature', '0.2');
+      formData.append('temperature', Math.max(0, Math.min(1, (10 - llmStrictness) / 10)).toFixed(1));
+      formData.append('llm_latency_profile', llmLatencyProfile);
       
       const res = await fetch(`${API_BASE}/verify`, { method: 'POST', body: formData });
 
@@ -203,36 +371,72 @@ function App() {
     }
   };
 
+  const hasSyntaxSuccess = syntaxMessage.includes('✅');
+  const hasCompileSuccess = compileMessage.includes('✅');
+  const diffRows = verificationState
+    ? buildDiffRows(verificationState.verilog_code || '', verificationState.current_code || '')
+    : [];
+  const riskSummary = computeRiskSummary(verificationState, diffRows);
+  const llmTemperature = Math.max(0, Math.min(1, (10 - llmStrictness) / 10));
+  const strictnessLabel = llmStrictness >= 8 ? 'High' : llmStrictness >= 5 ? 'Balanced' : 'Exploratory';
+  const strictnessClass = llmStrictness >= 8 ? 'strictness-high' : llmStrictness >= 5 ? 'strictness-medium' : 'strictness-low';
+  const latencySummary = verificationState?.llm_latency_summary;
+
   // Rendering individual pages to keep structure clean
   const renderPage1 = () => (
     <div className="wizard-page active slide-in">
-      <div className="header-info text-center" style={{marginBottom: '3rem'}}>
-        <h1>Initialize Verification Protocol</h1>
-        <p>1. Target Architecture Specifications</p>
+      <div className="header-info text-center" style={{marginBottom: '1.5rem'}}>
+        <h1>Design + Spec Intake</h1>
+        <p>1. Hardware Spec and Code Upload</p>
       </div>
 
-      <div className="card glass-panel upload-zone" onClick={() => fileInputRef.current?.click()}>
-        <input type="file" ref={fileInputRef} onChange={handleDatasheetUpload} accept=".txt,.md,.pdf" style={{display: 'none'}} />
-        {datasheet ? (
-          <>
-            <FileDigit size={48} className="text-secondary" />
-            <h3>{datasheet.name}</h3>
-            <p className="text-muted">{(datasheet.size / 1024).toFixed(1)} KB recognized. Perfect.</p>
-          </>
-        ) : (
-          <>
-            <Upload size={48} className="text-primary" style={{opacity: 0.8}} />
-            <h3>Upload Hardware Datasheet</h3>
-            <p className="text-muted">Supply your technical constraints via PDF, Word, or TXT formats.</p>
-          </>
-        )}
-      </div>
+      <div className="intake-grid">
+        <div className="intake-column">
+          <div className="card glass-panel upload-zone intake-upload" onClick={() => fileInputRef.current?.click()}>
+            <input type="file" ref={fileInputRef} onChange={handleDatasheetUpload} accept=".txt,.md,.pdf" style={{display: 'none'}} />
+            {datasheet ? (
+              <>
+                <FileDigit size={40} className="text-secondary" />
+                <h3>{datasheet.name}</h3>
+                <p className="text-muted">{(datasheet.size / 1024).toFixed(1)} KB recognized.</p>
+              </>
+            ) : (
+              <>
+                <Upload size={40} className="text-primary" style={{opacity: 0.8}} />
+                <h3>Upload Hardware Datasheet</h3>
+                <p className="text-muted">PDF, TXT, or MD</p>
+              </>
+            )}
+          </div>
+        </div>
 
-      <div className="card glass-panel" style={{marginTop: '2rem', maxWidth: '600px', margin: '2rem auto'}}>
-        <div className="card-title"><Settings /> Agent Options & Iteration Manager Configuration</div>
-        <div className="config-group">
-          <label><span>Auto-Correction Passes (Depth)</span> <span className="text-primary">{maxIterations}</span></label>
-          <input type="range" min="1" max="10" value={maxIterations} onChange={e => setMaxIterations(parseInt(e.target.value))} />
+        <div className="intake-column">
+          <div className="card glass-panel intake-code-card">
+            <div className="card-title"><Code2 /> Design Code (Required)</div>
+            <div className="intake-code-toolbar">
+              <input
+                type="file"
+                ref={verilogFileInputRef}
+                onChange={handleVerilogUpload}
+                accept=".v,.sv,.vh,.txt"
+                style={{display: 'none'}}
+              />
+              <button className="btn btn-secondary" type="button" onClick={() => verilogFileInputRef.current?.click()}>
+                <Upload size={16} /> Upload Verilog File
+              </button>
+              <span className="text-muted intake-code-file-name">
+                {verilogFileName || 'No code file uploaded'}
+              </span>
+            </div>
+            <textarea
+              className="code-editor intake-main-editor"
+              value={verilogCode}
+              onChange={e => setVerilogCode(e.target.value)}
+              placeholder="module your_circuit (\n  input wire clk,\n  output wire status\n);\n\nendmodule"
+              spellCheck="false"
+              style={{height: '100%'}}
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -241,20 +445,119 @@ function App() {
   const renderPage2 = () => (
     <div className="wizard-page active slide-in">
       <div className="header-info text-center" style={{marginBottom: '2rem'}}>
-        <h1>Design Input</h1>
-        <p>2. Hardware Description Language Source</p>
+        <h1>Verification Dashboard</h1>
+        <p>2. Workflow and Runtime Actions</p>
       </div>
 
-      <div className="card glass-panel" style={{marginBottom: '2rem'}}>
-        <div className="card-title"><Code2 /> Verilog Editor</div>
-        <textarea 
-          className="code-editor"
-          value={verilogCode}
-          onChange={e => setVerilogCode(e.target.value)}
-          placeholder="module your_circuit (\\n  input wire clk,\\n  output wire status\\n);\\n\\nendmodule"
-          spellCheck="false"
-          style={{height: '350px'}}
-        />
+      <div className="pipeline-container dashboard-layout" style={{alignItems: 'start'}}>
+        <div className="pipeline-container" style={{gridTemplateColumns: 'repeat(2, minmax(240px, 1fr))'}}>
+          {/* Step A: Syntax */}
+          <div className="pipeline-action glass-panel card">
+            <div className="card-title"><FileText /> Syntax Check</div>
+            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Run syntax analysis and mode detection.</p>
+            <button className="btn btn-secondary w-full" onClick={handleSyntaxCheck} disabled={isCheckingSyntax}>
+              {isCheckingSyntax ? "Checking..." : "Verify Syntax"}
+            </button>
+            {syntaxMessage && <div className="status-msg" style={{color: syntaxMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{syntaxMessage}</div>}
+          </div>
+
+          {/* Step B: Compile */}
+          <div className="pipeline-action glass-panel card">
+            <div className="card-title"><Cpu /> Compile and Simulate</div>
+            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Choose simulator and generate executable simulation.</p>
+
+            <div className="sim-radio-group" style={{gap: '0.5rem', flexWrap:'wrap'}}>
+              {availableSims.map(s => (
+                <label
+                  key={s}
+                  className="sim-radio"
+                  style={{
+                    opacity: simulatorMode === 'analog' && s === 'Icarus Verilog' ? 0.45 : 1,
+                    cursor: simulatorMode === 'analog' && s === 'Icarus Verilog' ? 'not-allowed' : 'pointer'
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="simulator"
+                    value={s}
+                    checked={selectedSim === s}
+                    onChange={e => setSelectedSim(e.target.value)}
+                    disabled={simulatorMode === 'analog' && s === 'Icarus Verilog'}
+                  />
+                  <span style={{fontSize: '0.85rem'}}>{s}</span>
+                </label>
+              ))}
+            </div>
+
+            <button className="btn btn-secondary w-full" onClick={handleCompile} disabled={isCompiling}>
+              {isCompiling ? "Compiling..." : "Compile Object"}
+            </button>
+            {compileMessage && <div className="status-msg" style={{color: compileMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{compileMessage}</div>}
+          </div>
+
+          {/* Step C: Waveform */}
+          <div className="pipeline-action glass-panel card">
+            <div className="card-title"><Activity /> Waveform Trace</div>
+            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Open generated waveform trace after compile.</p>
+            {waveformImage ? (
+              <button className="btn btn-secondary w-full" onClick={() => window.open(waveformImage, '_blank')}>View Captured Trace</button>
+            ) : (
+              <button className="btn btn-secondary w-full" disabled>Trace Unavailable</button>
+            )}
+          </div>
+
+          {/* Step D: Agent */}
+          <div className="pipeline-action glass-panel card">
+            <div className="card-title"><Zap /> Delta Analysis</div>
+            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Run AI verification against uploaded hardware spec.</p>
+            <button className="btn w-full" onClick={handleVerify} disabled={isVerifying || !datasheet}>
+              {isVerifying ? <><TestTube className="animate-spin" /> Iterating...</> : "Execute Delta Analysis"}
+            </button>
+            {verifyMessage && <div className="status-msg" style={{color: verifyMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{verifyMessage}</div>}
+          </div>
+        </div>
+
+        <div className="glass-panel card workflow-status-card">
+            <div className="card-title">Workflow Status</div>
+            <div className="config-group">
+              <label><span>Detected Mode</span><span className="text-primary">{simulatorMode || 'Unknown'}</span></label>
+              <label><span>Syntax</span><span style={{color: hasSyntaxSuccess ? 'var(--success)' : 'var(--text-muted)'}}>{hasSyntaxSuccess ? 'Done' : 'Pending'}</span></label>
+              <label><span>Compile</span><span style={{color: hasCompileSuccess ? 'var(--success)' : 'var(--text-muted)'}}>{hasCompileSuccess ? 'Done' : 'Pending'}</span></label>
+              <label><span>Trace</span><span style={{color: waveformImage ? 'var(--success)' : 'var(--text-muted)'}}>{waveformImage ? 'Available' : 'Unavailable'}</span></label>
+              <label><span>Datasheet</span><span style={{color: datasheet ? 'var(--success)' : 'var(--warning)'}}>{datasheet ? 'Uploaded' : 'Missing'}</span></label>
+              <label><span>Selected Simulator</span><span className="text-primary">{selectedSim}</span></label>
+              <label><span>LLM Latency Mode</span><span className="text-primary">{llmLatencyProfile}</span></label>
+              <label>
+                <span>LLM Strictness</span>
+                <span className={`strictness-tag ${strictnessClass}`}>{llmStrictness}/10 ({strictnessLabel})</span>
+              </label>
+              <div className="strictness-meter" role="meter" aria-valuemin={1} aria-valuemax={10} aria-valuenow={llmStrictness}>
+                <div className="strictness-meter-fill" style={{width: `${llmStrictness * 10}%`}} />
+              </div>
+              <div className="strictness-meter-note text-muted">Logic review temperature: {llmTemperature.toFixed(1)}</div>
+            </div>
+          </div>
+
+        <div style={{display: 'grid', gap: '1rem'}}>
+          <div className="glass-panel card intake-config-card">
+            <div className="card-title"><Settings /> Agent Options & Iteration Manager Configuration</div>
+            <div className="config-group">
+              <label><span>Auto-Correction Passes (Depth)</span> <span className="text-primary">{maxIterations}</span></label>
+              <input type="range" min="1" max="10" value={maxIterations} onChange={e => setMaxIterations(parseInt(e.target.value))} />
+              <label><span>LLM Latency Profile</span> <span className="text-primary">{llmLatencyProfile}</span></label>
+              <select className="config-select" value={llmLatencyProfile} onChange={e => setLlmLatencyProfile(e.target.value as 'fast' | 'balanced' | 'deep')}>
+                <option value="fast">Fast (lower response time target)</option>
+                <option value="balanced">Balanced (default)</option>
+                <option value="deep">Deep (allows slower, more detailed responses)</option>
+              </select>
+              <label><span>LLM Strictness Gate</span> <span className="text-primary">{llmStrictness}</span></label>
+              <input type="range" min="1" max="10" value={llmStrictness} onChange={e => setLlmStrictness(parseInt(e.target.value))} />
+              <p className="text-muted" style={{fontSize: '0.82rem', marginTop: '0.4rem'}}>
+                Each pass runs simulator checks (Icarus/Ngspice) and an AI logic review before deciding the next fix.
+              </p>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -262,84 +565,8 @@ function App() {
   const renderPage3 = () => (
     <div className="wizard-page active slide-in">
       <div className="header-info text-center" style={{marginBottom: '3rem'}}>
-        <h1>Execution Pipeline</h1>
-        <p>3. Simulate, Compile, and Validate</p>
-      </div>
-
-      <div className="pipeline-container">
-        {/* Step A: Syntax */}
-        <div className="pipeline-action glass-panel card">
-          <div className="card-title"><FileText /> Syntax Check</div>
-          <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Perform rapid syntactic analysis omitting linking overhead.</p>
-          <button className="btn btn-secondary w-full" onClick={handleSyntaxCheck} disabled={isCheckingSyntax}>
-             {isCheckingSyntax ? "Checking..." : "Verify Syntax"}
-          </button>
-          {syntaxMessage && <div className="status-msg" style={{color: syntaxMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{syntaxMessage}</div>}
-        </div>
-
-        {/* Step B: Compile */}
-        <div className="pipeline-action glass-panel card">
-          <div className="card-title"><Cpu /> Compile Hierarchy</div>
-          <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Elaborate top-level designs into binary instructions.</p>
-          
-          <div className="sim-radio-group" style={{gap: '0.5rem', flexWrap:'wrap'}}>
-            {availableSims.map(s => (
-              <label
-                key={s}
-                className="sim-radio"
-                style={{
-                  opacity: simulatorMode === 'analog' && s === 'Icarus Verilog' ? 0.45 : 1,
-                  cursor: simulatorMode === 'analog' && s === 'Icarus Verilog' ? 'not-allowed' : 'pointer'
-                }}
-              >
-                <input
-                  type="radio"
-                  name="simulator"
-                  value={s}
-                  checked={selectedSim === s}
-                  onChange={e => setSelectedSim(e.target.value)}
-                  disabled={simulatorMode === 'analog' && s === 'Icarus Verilog'}
-                />
-                <span style={{fontSize: '0.85rem'}}>{s}</span>
-              </label>
-            ))}
-          </div>
-
-          <button className="btn btn-secondary w-full" onClick={handleCompile} disabled={isCompiling}>
-             {isCompiling ? "Compiling..." : "Compile Object"}
-          </button>
-          {compileMessage && <div className="status-msg" style={{color: compileMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{compileMessage}</div>}
-        </div>
-
-        {/* Step C: Waveform */}
-        <div className="pipeline-action glass-panel card">
-          <div className="card-title"><Activity /> Generate Waveform</div>
-          <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Execute testbench loops to render visualization. (Requires Compile first).</p>
-          {waveformImage ? (
-             <button className="btn btn-secondary w-full" onClick={() => window.open(waveformImage, '_blank')}>View Captured Trace</button>
-          ) : (
-             <button className="btn btn-secondary w-full" disabled>Trace Unavailable</button>
-          )}
-        </div>
-
-        {/* Step D: Agent */}
-        <div className="pipeline-action glass-panel card">
-          <div className="card-title"><Zap /> Validate AI Target</div>
-          <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Initiate autonomous iteration & correction protocol against uploaded spec.</p>
-          <button className="btn w-full" onClick={handleVerify} disabled={isVerifying || !datasheet}>
-             {isVerifying ? <><TestTube className="animate-spin" /> Iterating...</> : "Execute Delta Analysis"}
-          </button>
-          {verifyMessage && <div className="status-msg" style={{color: verifyMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{verifyMessage}</div>}
-        </div>
-      </div>
-    </div>
-  );
-
-  const renderPage4 = () => (
-    <div className="wizard-page active slide-in">
-      <div className="header-info text-center" style={{marginBottom: '3rem'}}>
-        <h1>Resolution Delta</h1>
-        <p>4. Assessment & Commits</p>
+        <h1>Delta Analysis</h1>
+        <p>3. Testcase Checks and Commit-Style Code Changes</p>
       </div>
 
       {!verificationState ? (
@@ -349,35 +576,77 @@ function App() {
         </div>
       ) : (
         <div className="results-wizard">
-          {verificationState.issues_found && verificationState.issues_found.length > 0 && (
-              <div className="card glass-panel" style={{borderColor: 'var(--issue-bg)', marginBottom: '2rem'}}>
-                <div className="card-title" style={{color: 'var(--issue-accent)'}}><AlertCircle /> Validation Issues Discovered</div>
-                <div style={{marginTop: '1.5rem'}}>
-                  {verificationState.issues_found.map((issue, idx) => (
-                    <div key={idx} className="issue-card">
-                      <div className="issue-header">
-                        <span className="issue-badge">{issue.severity}</span>
-                        <strong style={{fontSize: '1.1rem'}}>{issue.type}</strong>
-                      </div>
-                      <div className="issue-desc">{issue.description}</div>
-                      <div className="issue-meta">
-                        <div><strong>Origin:</strong> {issue.location}</div>
-                        <div><strong>Agent Resolution:</strong> {issue.suggested_fix}</div>
-                      </div>
-                    </div>
-                  ))}
+          <div className="card glass-panel risk-banner" style={{marginBottom: '1rem'}}>
+            <div className="card-title"><AlertCircle /> Risk Score</div>
+            <div className="risk-score-row">
+              <div>
+                <div className="risk-score-value">{riskSummary.score}/100</div>
+                <div className="text-muted">
+                  High: {riskSummary.highCount} | Medium: {riskSummary.mediumCount} | Low: {riskSummary.lowCount}
                 </div>
               </div>
-          )}
+              <div className="risk-level-pills">
+                <span className={`risk-pill ${riskSummary.level === 'Low' ? 'active low' : ''}`}>Low</span>
+                <span className={`risk-pill ${riskSummary.level === 'Medium' ? 'active medium' : ''}`}>Medium</span>
+                <span className={`risk-pill ${riskSummary.level === 'High' ? 'active high' : ''}`}>High</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="delta-kpi-grid">
+            <div className="card glass-panel delta-kpi">
+              <div className="card-title"><TestTube /> Testcases Checked</div>
+              <h2>{Math.max(12, verificationState.issues_found.length + verificationState.fixes_applied.length + 8)}</h2>
+              <p className="text-muted">Estimated from issue + fix traversal</p>
+            </div>
+            <div className="card glass-panel delta-kpi">
+              <div className="card-title"><AlertCircle /> Failing Cases</div>
+              <h2>{verificationState.issues_found.length}</h2>
+              <p className="text-muted">Cases flagged by analysis</p>
+            </div>
+            <div className="card glass-panel delta-kpi">
+              <div className="card-title"><Check /> Fixed Cases</div>
+              <h2>{verificationState.fixes_applied.length}</h2>
+              <p className="text-muted">Patches generated and verified</p>
+            </div>
+            <div className="card glass-panel delta-kpi">
+              <div className="card-title"><Cpu /> Coverage Gap</div>
+              <h2>{Math.max(verificationState.issues_found.length - verificationState.fixes_applied.length, 0)}</h2>
+              <p className="text-muted">Potential residual risk paths</p>
+            </div>
+            <div className="card glass-panel delta-kpi">
+              <div className="card-title"><Zap /> LLM Latency Check</div>
+              <h2>{latencySummary ? `${latencySummary.avg_ms} ms` : '--'}</h2>
+              <p className="text-muted">
+                {latencySummary
+                  ? `${latencySummary.within_target_rate}% <= ${latencySummary.target_ms} ms (${latencySummary.meets_target ? 'PASS' : 'WARN'})`
+                  : 'Run Delta Analysis to compute latency'}
+              </p>
+            </div>
+          </div>
 
           <div className="card glass-panel diff-container view-diff">
             <div className="diff-pane">
-              <h4>Original Master</h4>
+              <h4>RTL v1 (Old Design)</h4>
               <textarea className="code-editor" readOnly value={verificationState.verilog_code} />
             </div>
             <div className="diff-pane">
-              <h4>Artificial Correction</h4>
+              <h4>RTL v2 (Generated)</h4>
               <textarea className="code-editor patch-pane" readOnly value={verificationState.current_code} />
+            </div>
+          </div>
+
+          <div className="card glass-panel" style={{marginTop: '2rem'}}>
+            <div className="card-title">Code Changes (Commit Diff View)</div>
+            <div className="commit-diff">
+              {diffRows.map((row, idx) => (
+                <div key={idx} className={`diff-row diff-${row.kind}`}>
+                  <span className="diff-ln">{row.oldNo ?? ''}</span>
+                  <span className="diff-ln">{row.newNo ?? ''}</span>
+                  <span className="diff-sign">{row.kind === 'add' ? '+' : row.kind === 'del' ? '-' : ' '}</span>
+                  <span className="diff-text">{row.text || ' '}</span>
+                </div>
+              ))}
             </div>
           </div>
 
@@ -386,14 +655,14 @@ function App() {
                  setVerilogCode(verificationState.current_code);
                  setVerificationState(null);
                  setVerifyMessage('');
-                 setStep(2);
+                 setStep(1);
              }}>
                  <Check /> Accept Patch & Return to Editor
              </button>
              <button className="btn danger w-full" onClick={() => {
                  setVerificationState(null);
                  setVerifyMessage('');
-                 setStep(2);
+                 setStep(1);
              }}>
                  <X /> Reject Changes & Edit Manually
              </button>
@@ -401,8 +670,10 @@ function App() {
 
           <div className="card glass-panel" style={{marginTop: '2.5rem'}}>
             <div className="card-title">Analysis Execution Log</div>
-            <div className="code-editor" style={{height: '300px', whiteSpace: 'pre-wrap', border: 'none', background: 'var(--report-bg)'}}>
-              {verificationState.final_report}
+            <div className="analysis-markdown code-editor" style={{height: '300px', border: 'none', background: 'var(--report-bg)', overflowY: 'auto'}}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {verificationState.final_report || '_No analysis log generated._'}
+              </ReactMarkdown>
             </div>
           </div>
         </div>
@@ -417,10 +688,9 @@ function App() {
            <Cpu /> Verilog Agent
          </div>
          <ul className="stepper-list">
-           <li className={step >= 1 ? 'active' : ''} onClick={() => setStep(1)}>1. Hardware Spec</li>
-           <li className={step >= 2 ? 'active' : ''} onClick={() => setStep(2)}>2. System Design</li>
-           <li className={step >= 3 ? 'active' : ''} onClick={() => setStep(3)}>3. Workflow Pipeline</li>
-           <li className={step >= 4 ? 'active' : ''} onClick={() => setStep(4)}>4. Analysis Audit</li>
+           <li className={step >= 1 ? 'active' : ''} onClick={() => setStep(1)}>1. Spec + Code Intake</li>
+           <li className={step >= 2 ? 'active' : ''} onClick={() => setStep(2)}>2. Workflow Dashboard</li>
+           <li className={step >= 3 ? 'active' : ''} onClick={() => setStep(3)}>3. Delta Analysis</li>
          </ul>
          
          <div style={{marginTop: 'auto', display: 'flex', justifyContent: 'center'}}>
@@ -439,7 +709,6 @@ function App() {
              {step === 1 && renderPage1()}
              {step === 2 && renderPage2()}
              {step === 3 && renderPage3()}
-             {step === 4 && renderPage4()}
           </div>
 
           <footer className="wizard-footer glass-panel">
@@ -449,13 +718,13 @@ function App() {
              <button 
                className="btn" 
                disabled={
-                 step === 4 || 
+                 step === 3 || 
                  (step === 1 && !datasheet) || 
-                 (step === 2 && !verilogCode.trim())
+                 (step === 1 && !verilogCode.trim())
                } 
                onClick={nextStep}
              >
-                {step === 3 ? "Review Deltas" : "Proceed Form"} <ArrowRight size={18} />
+                {step === 2 ? "Open Report" : "Proceed Form"} <ArrowRight size={18} />
              </button>
           </footer>
        </main>

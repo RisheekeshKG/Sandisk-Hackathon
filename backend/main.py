@@ -92,8 +92,10 @@ def compile_verilog(req: CompileRequest):
 async def verify_design(
     verilog_code: str = Form(...),
     max_iterations: int = Form(5),
+    simulator: str = Form("Icarus Verilog"),
     model_name: str = Form("gemini-2.5-flash"),
     temperature: float = Form(0.2),
+    llm_latency_profile: str = Form("balanced"),
     datasheet: UploadFile = File(None),
     image_path: str = Form(None)
 ):
@@ -116,7 +118,11 @@ async def verify_design(
     try:
         agent = VerilogVerificationAgent(
             api_key=Config.GOOGLE_API_KEY,
-            max_iterations=max_iterations
+            max_iterations=max_iterations,
+            simulator=simulator,
+            model_name=model_name,
+            temperature=temperature,
+            llm_latency_profile=llm_latency_profile,
         )
     except Exception as e:
         return JSONResponse(status_code=500, content={"success": False, "message": f"Failed to initialize agent: {str(e)}"})

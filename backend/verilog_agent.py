@@ -8,10 +8,12 @@ import os
 from typing import TypedDict, Annotated, List, Optional
 from datetime import datetime
 from pathlib import Path
+import time
 
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from google import genai
+from waveform_generator import WaveformGenerator
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -29,9 +31,15 @@ class AgentState(TypedDict):
     issues_found: List[dict]
     fixes_applied: List[dict]
     analysis_history: List[str]
+    compiler_history: List[dict]
+    last_compiler_check: dict
+    llm_call_metrics: List[dict]
+    llm_latency_summary: dict
     final_report: str
     status: str  # 'analyzing', 'fixing', 'verified', 'failed'
     design_image_path: Optional[str]
+    simulator: str
+    llm_latency_profile: str
 
 
 class VerilogVerificationAgent:
@@ -39,7 +47,15 @@ class VerilogVerificationAgent:
     LangGraph-based agent for Verilog design verification using Gemini
     """
     
-    def __init__(self, api_key: str, max_iterations: int = 5):
+    def __init__(
+        self,
+        api_key: str,
+        max_iterations: int = 5,
+        simulator: str = "Icarus Verilog",
+        model_name: str = "gemini-2.5-flash",
+        temperature: float = 0.2,
+        llm_latency_profile: str = "balanced",
+    ):
         """
         Initialize the Verilog Verification Agent
         
@@ -49,20 +65,126 @@ class VerilogVerificationAgent:
         """
         self.api_key = api_key
         self.max_iterations = max_iterations
+        self.simulator = simulator
+        self.llm_latency_profile = llm_latency_profile.lower().strip() or "balanced"
         
         # Configure Gemini with new API
         self.client = genai.Client(api_key=api_key)
         
         # Initialize Gemini model
         self.model = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
+            model=model_name,
             google_api_key=api_key,
-            temperature=0.2  # Lower temperature for more consistent analysis
+            temperature=temperature
         )
         
         # Build the graph
         self.workflow = self._build_graph()
         self.app = self.workflow.compile()
+
+    def _latency_target_ms(self, profile: str) -> int:
+        profile_l = (profile or "balanced").lower()
+        if profile_l == "fast":
+            return 2500
+        if profile_l == "deep":
+            return 9000
+        return 5000
+
+    def _invoke_model(self, prompt: str, state: Optional[AgentState], stage: str) -> str:
+        started = time.perf_counter()
+        response = self.model.invoke(prompt).content
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+        if state is not None:
+            state["llm_call_metrics"].append(
+                {
+                    "stage": stage,
+                    "latency_ms": elapsed_ms,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+
+        return response
+
+    def _update_latency_summary(self, state: AgentState) -> None:
+        metrics = state.get("llm_call_metrics", [])
+        target_ms = self._latency_target_ms(state.get("llm_latency_profile", self.llm_latency_profile))
+
+        if not metrics:
+            state["llm_latency_summary"] = {
+                "profile": state.get("llm_latency_profile", self.llm_latency_profile),
+                "target_ms": target_ms,
+                "calls": 0,
+                "avg_ms": 0,
+                "max_ms": 0,
+                "total_ms": 0,
+                "within_target_calls": 0,
+                "within_target_rate": 0,
+                "meets_target": True,
+            }
+            return
+
+        latencies = [int(m.get("latency_ms", 0)) for m in metrics]
+        total_ms = sum(latencies)
+        calls = len(latencies)
+        avg_ms = int(total_ms / calls) if calls else 0
+        max_ms = max(latencies) if latencies else 0
+        within_target = sum(1 for x in latencies if x <= target_ms)
+        within_rate = round((within_target / calls) * 100, 1) if calls else 0.0
+
+        state["llm_latency_summary"] = {
+            "profile": state.get("llm_latency_profile", self.llm_latency_profile),
+            "target_ms": target_ms,
+            "calls": calls,
+            "avg_ms": avg_ms,
+            "max_ms": max_ms,
+            "total_ms": total_ms,
+            "within_target_calls": within_target,
+            "within_target_rate": within_rate,
+            "meets_target": bool(within_rate >= 80.0),
+        }
+
+    def _is_analog_code(self, verilog_code: str) -> bool:
+        lower = verilog_code.lower()
+        return (
+            "`include \"disciplines.vams\"" in lower
+            or "analog begin" in lower
+            or "electrical " in lower
+            or "<+" in verilog_code
+        )
+
+    def _resolve_iteration_simulator(self, state: AgentState) -> str:
+        preferred = state.get("simulator", self.simulator)
+        if self._is_analog_code(state["current_code"]):
+            return "ngspice"
+        if preferred == "Ngspice":
+            return "ngspice"
+        return "iverilog"
+
+    def _run_compiler_checks(self, state: AgentState) -> dict:
+        """Run syntax + compile checks every iteration using selected simulator."""
+        sim_type = self._resolve_iteration_simulator(state)
+        waveform_gen = WaveformGenerator(simulator=sim_type)
+
+        syntax_ok, syntax_msg = waveform_gen.check_syntax(state["current_code"])
+        compile_ok = False
+        compile_msg = "Compile skipped because syntax failed"
+
+        if syntax_ok:
+            compile_ok, compile_msg = waveform_gen.compile_verilog(state["current_code"])
+
+        waveform_gen.cleanup()
+
+        return {
+            "iteration": state["iteration"],
+            "simulator": sim_type,
+            "syntax_ok": syntax_ok,
+            "syntax_msg": syntax_msg,
+            "compile_ok": compile_ok,
+            "compile_msg": compile_msg,
+            "passed": bool(syntax_ok and compile_ok),
+            "timestamp": datetime.now().isoformat(),
+        }
     
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow"""
@@ -153,7 +275,7 @@ class VerilogVerificationAgent:
             Provide a detailed technical summary focusing on aspects relevant to Verilog implementation.
             """
             
-            response = self.model.invoke(prompt).content
+            response = self._invoke_model(prompt, None, "analyze_datasheet")
             return response
             
         except Exception as e:
@@ -170,33 +292,38 @@ class VerilogVerificationAgent:
         if not datasheet_content:
             datasheet_content = self._extract_datasheet_content(state["datasheet_path"])
             state["datasheet_content"] = datasheet_content
-        
-        datasheet_analysis = self._analyze_datasheet(datasheet_content)
-        
-        # Analyze Verilog code structure
-        code_analysis_prompt = f"""
-        Analyze this Verilog code and provide:
-        1. Module hierarchy and interfaces
-        2. Key functionality implemented
-        3. Design patterns used
-        4. Overall code structure
-        
+
+        # Single LLM call: analyze datasheet and RTL together to reduce latency.
+        combined_prompt = f"""
+        Analyze the following datasheet and Verilog code together and produce one unified report.
+
+        Include these sections:
+        1. DATASHEET ANALYSIS
+           - Component name/type
+           - Pin/config overview
+           - Key electrical/timing constraints
+           - Required behaviors for implementation
+
+        2. CODE STRUCTURE ANALYSIS
+           - Module hierarchy/interfaces
+           - Functionality implemented
+           - Design pattern/style observations
+
+        3. DESIGN-CODE ALIGNMENT SUMMARY
+           - Major matches
+           - Potential mismatches
+           - Risks to verify in later steps
+
+        Datasheet Content:
+        {datasheet_content[:15000]}
+
         Verilog Code:
         ```verilog
         {state["verilog_code"]}
         ```
         """
-        
-        code_analysis = self.model.invoke(code_analysis_prompt).content
-        
-        # Combined analysis
-        combined_analysis = f"""
-        DATASHEET ANALYSIS:
-        {datasheet_analysis}
-        
-        CODE STRUCTURE ANALYSIS:
-        {code_analysis}
-        """
+
+        combined_analysis = self._invoke_model(combined_prompt, state, "analyze_design")
         
         state["analysis_history"].append(combined_analysis)
         state["status"] = "analyzing"
@@ -217,6 +344,18 @@ class VerilogVerificationAgent:
         waveform_context = ""
         if state.get("design_image_path"):
             waveform_context = "\n\nNote: A waveform diagram is available showing the signal behavior. Consider timing and signal transitions when identifying issues."
+
+        compiler_context = ""
+        if state.get("last_compiler_check"):
+            c = state["last_compiler_check"]
+            compiler_context = f"""
+
+        Compiler/Simulator Validation (Iteration {c.get('iteration', state['iteration'])}, simulator={c.get('simulator', 'unknown')}):
+        - Syntax: {'PASS' if c.get('syntax_ok') else 'FAIL'}
+        - Syntax Details: {c.get('syntax_msg', '')}
+        - Compile/Netlist Build: {'PASS' if c.get('compile_ok') else 'FAIL'}
+        - Compile Details: {c.get('compile_msg', '')}
+        """
         
         prompt = f"""
         You are an expert hardware design verification engineer.
@@ -229,7 +368,7 @@ class VerilogVerificationAgent:
         Current Verilog Code:
         ```verilog
         {state["current_code"]}
-        ```{waveform_context}
+        ```{waveform_context}{compiler_context}
         
         Identify:
         1. Mismatches between the datasheet specifications and code implementation
@@ -263,7 +402,7 @@ class VerilogVerificationAgent:
         ISSUES_FOUND: 0
         """
         
-        response = self.model.invoke(prompt).content
+        response = self._invoke_model(prompt, state, "identify_issues")
         
         # Parse issues
         issues = self._parse_issues(response)
@@ -348,7 +487,7 @@ class VerilogVerificationAgent:
         Respond ONLY with the fixed Verilog code, no explanations outside the code.
         """
         
-        fixed_code = self.model.invoke(prompt).content
+        fixed_code = self._invoke_model(prompt, state, "fix_issues")
         
         # Extract code from markdown if present
         if "```verilog" in fixed_code:
@@ -374,6 +513,16 @@ class VerilogVerificationAgent:
         print(f"{'='*60}")
         
         state["iteration"] += 1
+
+        compiler_result = self._run_compiler_checks(state)
+        state["last_compiler_check"] = compiler_result
+        state["compiler_history"].append(compiler_result)
+
+        print(
+            "Compiler checks:",
+            f"syntax={'PASS' if compiler_result['syntax_ok'] else 'FAIL'},",
+            f"compile={'PASS' if compiler_result['compile_ok'] else 'FAIL'}"
+        )
         
         # Simple verification - check if code compiles and looks valid
         prompt = f"""
@@ -381,24 +530,45 @@ class VerilogVerificationAgent:
         1. Syntactically correct
         2. Logically sound
         3. Follows best practices
+
+        Compiler/Simulator Validation:
+        - Simulator: {compiler_result['simulator']}
+        - Syntax Result: {'PASS' if compiler_result['syntax_ok'] else 'FAIL'}
+        - Syntax Message: {compiler_result['syntax_msg']}
+        - Compile Result: {'PASS' if compiler_result['compile_ok'] else 'FAIL'}
+        - Compile Message: {compiler_result['compile_msg']}
         
         Code:
         ```verilog
         {state["current_code"]}
         ```
         
-        Respond with: VERIFIED or NEEDS_WORK
+        Respond with: VERIFIED or NEEDS_WORK.
+        Rules:
+        - If compiler/simulator validation failed, you MUST respond NEEDS_WORK.
+        - Only respond VERIFIED when both compiler checks pass and no major logic issues remain.
         Provide brief explanation.
         """
         
-        verification = self.model.invoke(prompt).content
+        verification = self._invoke_model(prompt, state, "verify_fixes")
         
-        if "VERIFIED" in verification.upper():
+        if compiler_result["passed"] and "VERIFIED" in verification.upper():
             state["status"] = "verified"
             print("✓ Code verified successfully")
         else:
             state["status"] = "needs_work"
             print("⚠ Code needs more work")
+
+        state["analysis_history"].append(
+            (
+                f"Iteration {state['iteration']} compiler check ({compiler_result['simulator']}): "
+                f"syntax={'PASS' if compiler_result['syntax_ok'] else 'FAIL'}, "
+                f"compile={'PASS' if compiler_result['compile_ok'] else 'FAIL'}.\n"
+                f"Syntax message: {compiler_result['syntax_msg']}\n"
+                f"Compile message: {compiler_result['compile_msg']}\n"
+                f"LLM verification: {verification}"
+            )
+        )
         
         return state
     
@@ -418,6 +588,9 @@ class VerilogVerificationAgent:
         print(f"\n{'='*60}")
         print("STEP 5: Generating Final Report")
         print(f"{'='*60}")
+
+        self._update_latency_summary(state)
+        latency_summary = state.get("llm_latency_summary", {})
         
         prompt = f"""
         Generate a comprehensive Verilog design verification report.
@@ -428,6 +601,12 @@ class VerilogVerificationAgent:
         ITERATIONS PERFORMED: {state["iteration"]}
         FIXES APPLIED: {len(state["fixes_applied"])}
         FINAL STATUS: {state["status"]}
+        COMPILER CHECKS RUN: {len(state.get("compiler_history", []))}
+        LLM LATENCY PROFILE: {latency_summary.get("profile", self.llm_latency_profile)}
+        LLM LATENCY TARGET (ms/call): {latency_summary.get("target_ms", self._latency_target_ms(self.llm_latency_profile))}
+        LLM LATENCY AVG (ms/call): {latency_summary.get("avg_ms", 0)}
+        LLM LATENCY MAX (ms/call): {latency_summary.get("max_ms", 0)}
+        LLM LATENCY WITHIN TARGET: {latency_summary.get("within_target_rate", 0)}%
         
         FINAL CODE:
         ```verilog
@@ -471,8 +650,9 @@ class VerilogVerificationAgent:
         Format the report professionally with clear sections and bullet points.
         """
         
-        report = self.model.invoke(prompt).content
+        report = self._invoke_model(prompt, state, "generate_report")
         state["final_report"] = report
+        self._update_latency_summary(state)
         
         print("✓ Report generated successfully")
         
@@ -507,9 +687,15 @@ class VerilogVerificationAgent:
             "issues_found": [],
             "fixes_applied": [],
             "analysis_history": [],
+            "compiler_history": [],
+            "last_compiler_check": {},
+            "llm_call_metrics": [],
+            "llm_latency_summary": {},
             "final_report": "",
             "status": "initializing",
-            "design_image_path": design_image_path
+            "design_image_path": design_image_path,
+            "simulator": self.simulator,
+            "llm_latency_profile": self.llm_latency_profile,
         }
         
         # Run the workflow
