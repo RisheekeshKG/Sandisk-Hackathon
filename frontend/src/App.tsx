@@ -685,7 +685,7 @@ function App() {
     <div className="app-container layout-wizard">
        <nav className="wizard-stepper glass-panel">
          <div className="brand" style={{marginBottom: '2rem', justifyContent: 'center'}}>
-           <Cpu /> Verilog Agent
+           <Cpu /> VIGIL - AI
          </div>
          <ul className="stepper-list">
            <li className={step >= 1 ? 'active' : ''} onClick={() => setStep(1)}>1. Spec + Code Intake</li>
