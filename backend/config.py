@@ -13,7 +13,7 @@ class Config:
     """Configuration settings for the agent"""
     
     # API Keys
-    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyA6jiUSFZzMJYDIiANqXeQxb44GDOe1llo")
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
     
     # Agent Settings
     MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "5"))
