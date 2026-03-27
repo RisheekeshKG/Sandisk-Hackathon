@@ -1,0 +1,43 @@
+name: VIGIL-AI Verification Agent (Sandisk)
+
+on:
+  push:
+    paths:
+      - 'inputs/current_run.json'
+    branches:
+      - main
+      - master
+
+jobs:
+  verify:
+    name: "🛡️ Run Verification Agent"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends iverilog ngspice git
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run VIGIL-AI Verification Agent
+        env:
+          GOOGLE_API_KEY:     ${{ secrets.GOOGLE_API_KEY }}
+          GITHUB_TOKEN:       ${{ secrets.VIGIL_GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+        run: |
+          cd backend
+          python agent_runner.py

@@ -554,10 +554,10 @@ class VerilogVerificationAgent:
         
         if compiler_result["passed"] and "VERIFIED" in verification.upper():
             state["status"] = "verified"
-            print("✓ Code verified successfully")
+            print("[OK] Code verified successfully")
         else:
             state["status"] = "needs_work"
-            print("⚠ Code needs more work")
+            print("[WARN] Code needs more work")
 
         state["analysis_history"].append(
             (
@@ -578,7 +578,7 @@ class VerilogVerificationAgent:
             return "finish"
         
         if state["iteration"] >= state["max_iterations"]:
-            print(f"\n⚠ Reached maximum iterations ({state['max_iterations']})")
+            print(f"\n[WARN] Reached maximum iterations ({state['max_iterations']})")
             return "finish"
         
         return "continue"
@@ -654,7 +654,7 @@ class VerilogVerificationAgent:
         state["final_report"] = report
         self._update_latency_summary(state)
         
-        print("✓ Report generated successfully")
+        print("[OK] Report generated successfully")
         
         return state
     
@@ -721,4 +721,4 @@ class VerilogVerificationAgent:
             f.write(state['current_code'])
             f.write("\n```\n")
         
-        print(f"\n✓ Report saved to: {output_path}")
+        print(f"\n[OK] Report saved to: {output_path}")
