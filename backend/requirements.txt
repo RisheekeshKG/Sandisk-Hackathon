@@ -1,0 +1,32 @@
+# LangGraph and LangChain dependencies
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-google-genai>=1.0.0
+
+# Google Gemini API
+google-genai>=0.1.0
+
+# PDF processing
+pypdf>=4.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+
+# Streamlit UI
+streamlit>=1.28.0
+streamlit-flow>=0.0.3
+
+# Visualization
+plotly>=5.17.0
+graphviz>=0.20.0
+matplotlib>=3.7.0
+vcdvcd>=2.3.0
+
+# Optional: for Verilog syntax checking
+# You may want to add additional tools for Verilog verification
+
+# FastAPI backend
+fastapi>=0.103.0
+python-multipart>=0.0.6
+uvicorn>=0.23.2
