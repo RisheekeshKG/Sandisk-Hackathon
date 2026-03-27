@@ -22,6 +22,16 @@ type VerificationState = {
   current_code: string;
   verilog_code: string;
   final_report: string;
+  compiler_history?: Array<{
+    iteration: number;
+    simulator: string;
+    syntax_ok: boolean;
+    syntax_msg: string;
+    compile_ok: boolean;
+    compile_msg: string;
+    passed: boolean;
+    timestamp: string;
+  }>;
   llm_latency_summary?: {
     profile: string;
     target_ms: number;
@@ -48,6 +58,47 @@ type RiskSummary = {
   highCount: number;
   mediumCount: number;
   lowCount: number;
+};
+
+type ExecutedTestRow = {
+  name: string;
+  input: string;
+  output: string;
+  status: 'PASS' | 'FAIL';
+};
+
+const extractModuleNames = (code: string): string[] => {
+  const names = new Set<string>();
+  const re = /\bmodule\s+([a-zA-Z_][a-zA-Z0-9_$]*)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    names.add(m[1]);
+  }
+  return Array.from(names);
+};
+
+const extractChangedSignals = (rows: DiffRow[]): string[] => {
+  const keywords = new Set([
+    'module', 'endmodule', 'input', 'output', 'inout', 'wire', 'reg', 'logic',
+    'assign', 'always', 'begin', 'end', 'if', 'else', 'case', 'for', 'while',
+    'parameter', 'localparam', 'generate', 'endgenerate', 'posedge', 'negedge'
+  ]);
+
+  const ids = new Set<string>();
+  const idRe = /\b[a-zA-Z_][a-zA-Z0-9_$]*\b/g;
+  for (const row of rows) {
+    if (row.kind === 'context') continue;
+    const line = row.text.replace(/\/\/.*$/, ' ').replace(/\/\*.*?\*\//g, ' ');
+    let m: RegExpExecArray | null;
+    while ((m = idRe.exec(line)) !== null) {
+      const t = m[0];
+      if (!keywords.has(t.toLowerCase()) && !/^\d/.test(t)) {
+        ids.add(t);
+      }
+    }
+  }
+
+  return Array.from(ids).slice(0, 24);
 };
 
 const buildDiffRows = (oldCode: string, newCode: string): DiffRow[] => {
@@ -188,6 +239,8 @@ const parseApiResponse = async (res: Response) => {
 };
 
 function App() {
+  const PAST_OUTPUT_CACHE_KEY = 'vigil_past_output_code';
+  const LATEST_OUTPUT_CACHE_KEY = 'vigil_latest_output_code';
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [step, setStep] = useState(1);
   const [maxIterations, setMaxIterations] = useState(5);
@@ -195,7 +248,7 @@ function App() {
   const [datasheet, setDatasheet] = useState<File | null>(null);
   const [verilogCode, setVerilogCode] = useState('');
   const [verilogFileName, setVerilogFileName] = useState('');
-  const [verificationCode, setVerificationCode] = useState('');
+  const [verificationCode] = useState('');
   
   const [availableSims, setAvailableSims] = useState<string[]>(['Icarus Verilog', 'Ngspice']);
   const [selectedSim, setSelectedSim] = useState('Ngspice');
@@ -212,6 +265,8 @@ function App() {
   
   const [isVerifying, setIsVerifying] = useState(false);
   const [verificationState, setVerificationState] = useState<VerificationState | null>(null);
+  const [pastOutputCode, setPastOutputCode] = useState('');
+  const [latestOutputCode, setLatestOutputCode] = useState('');
   const [verifyMessage, setVerifyMessage] = useState('');
   const [llmStrictness, setLlmStrictness] = useState(8);
   const [llmLatencyProfile, setLlmLatencyProfile] = useState<'fast' | 'balanced' | 'deep'>('balanced');
@@ -233,6 +288,13 @@ function App() {
         }
       })
       .catch(err => console.error("Failed to fetch simulator status", err));
+  }, []);
+
+  useEffect(() => {
+    const cachedPast = localStorage.getItem(PAST_OUTPUT_CACHE_KEY) || '';
+    const cachedLatest = localStorage.getItem(LATEST_OUTPUT_CACHE_KEY) || '';
+    setPastOutputCode(cachedPast);
+    setLatestOutputCode(cachedLatest);
   }, []);
 
   const handleDatasheetUpload = (e: ChangeEvent<HTMLInputElement>) => {
@@ -261,7 +323,7 @@ function App() {
     }
   };
 
-  const nextStep = () => setStep(s => Math.min(s + 1, 3));
+  const nextStep = () => setStep(s => Math.min(s + 1, 5));
   const prevStep = () => setStep(s => Math.max(s - 1, 1));
 
   const getSimulationInputCode = () => {
@@ -360,6 +422,17 @@ function App() {
       if (!res.ok || !data.success) {
         throw new Error(data.message || "Verification task failed on server.");
       }
+
+      const currentOutput = (data.state?.current_code || '').trim();
+      if (currentOutput) {
+        const previousLatest = (localStorage.getItem(LATEST_OUTPUT_CACHE_KEY) || '').trim();
+        if (previousLatest && previousLatest !== currentOutput) {
+          localStorage.setItem(PAST_OUTPUT_CACHE_KEY, previousLatest);
+          setPastOutputCode(previousLatest);
+        }
+        localStorage.setItem(LATEST_OUTPUT_CACHE_KEY, currentOutput);
+        setLatestOutputCode(currentOutput);
+      }
       
       setVerificationState(data.state);
       setVerifyMessage("✅ Automated patching process wrapped up successfully.");
@@ -381,6 +454,24 @@ function App() {
   const strictnessLabel = llmStrictness >= 8 ? 'High' : llmStrictness >= 5 ? 'Balanced' : 'Exploratory';
   const strictnessClass = llmStrictness >= 8 ? 'strictness-high' : llmStrictness >= 5 ? 'strictness-medium' : 'strictness-low';
   const latencySummary = verificationState?.llm_latency_summary;
+  const compilerHistory = verificationState?.compiler_history || [];
+  const executedTests: ExecutedTestRow[] = compilerHistory.map((c, idx) => ({
+    name: `Test Case ${idx + 1}`,
+    input: `Iteration ${c.iteration} | ${c.simulator} | Syntax+Compile` ,
+    output: `${c.passed ? 'PASS' : 'FAIL'} | ${c.compile_ok ? c.compile_msg : c.syntax_msg}`,
+    status: c.passed ? 'PASS' : 'FAIL'
+  }));
+  const changedSignals = extractChangedSignals(diffRows);
+  const affectedModules = verificationState
+    ? extractModuleNames(`${verificationState.verilog_code || ''}\n${verificationState.current_code || ''}`)
+    : [];
+  const unresolvedCases = Math.max((verificationState?.issues_found?.length || 0) - (verificationState?.fixes_applied?.length || 0), 0);
+  const suggestedTests = (verificationState?.issues_found || [])
+    .slice(0, 5)
+    .map((issue: any, idx: number) => `Scenario ${idx + 1}: ${(issue?.type || 'logic').toString()} check`);
+  const pastVsPresentRows = verificationState
+    ? buildDiffRows(pastOutputCode || '', verificationState.current_code || '')
+    : buildDiffRows(pastOutputCode || '', latestOutputCode || '');
 
   // Rendering individual pages to keep structure clean
   const renderPage1 = () => (
@@ -681,6 +772,194 @@ function App() {
     </div>
   );
 
+  const renderPage4 = () => (
+    <div className="wizard-page active slide-in">
+      <div className="header-info text-center" style={{marginBottom: '2.2rem'}}>
+        <h1>AI Insights</h1>
+        <p>4. Executed Tests + AI Analysis + Verification Output</p>
+      </div>
+
+      {!verificationState ? (
+        <div className="card glass-panel text-center">
+          <h3>No Verification Snapshot Found</h3>
+          <p className="text-muted">Run Delta Analysis first, then open this page for test and AI insight tables.</p>
+        </div>
+      ) : (
+        <div style={{display: 'grid', gap: '1rem'}}>
+          <div className="card glass-panel">
+            <div className="card-title"><TestTube /> Executed Test Cases</div>
+            <div className="insight-table-wrap">
+              <table className="insight-table">
+                <thead>
+                  <tr>
+                    <th>Input Test Case</th>
+                    <th>Output</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {executedTests.length === 0 ? (
+                    <tr>
+                      <td colSpan={2} className="text-muted">No compiler-backed test records yet. Run Delta Analysis to populate this table.</td>
+                    </tr>
+                  ) : (
+                    executedTests.map((t, idx) => (
+                      <tr key={idx}>
+                        <td>{t.input}</td>
+                        <td>
+                          <span className={`table-pill ${t.status === 'PASS' ? 'ok' : 'bad'}`}>{t.status}</span>
+                          <span style={{marginLeft: '0.45rem'}}>{t.output}</span>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="card glass-panel">
+            <div className="card-title">AI Analysis</div>
+            <div className="ai-analysis-stack">
+              <div className="ai-analysis-item">
+                <h4>Changed Signals</h4>
+                <p className="ai-metric-value">{changedSignals.length}</p>
+                <p className="text-muted">{changedSignals.slice(0, 5).join(', ') || 'No major signal deltas detected'}</p>
+              </div>
+              <div className="ai-analysis-item">
+                <h4>Affected Modules</h4>
+                <p className="ai-metric-value">{affectedModules.length}</p>
+                <p className="text-muted">{affectedModules.slice(0, 5).join(', ') || 'No module boundaries detected'}</p>
+              </div>
+              <div className="ai-analysis-item">
+                <h4>Risk Level</h4>
+                <div className="risk-level-pills" style={{marginTop: '0.55rem'}}>
+                  <span className={`risk-pill ${riskSummary.level === 'Low' ? 'active low' : ''}`}>Low</span>
+                  <span className={`risk-pill ${riskSummary.level === 'Medium' ? 'active medium' : ''}`}>Medium</span>
+                  <span className={`risk-pill ${riskSummary.level === 'High' ? 'active high' : ''}`}>High</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="card glass-panel">
+            <div className="card-title">Verification Output</div>
+            <div className="verification-output-grid">
+              <div className="verification-tile">
+                <h4>Affected Test Cases</h4>
+                <p className="verification-big">{executedTests.length} <span className="text-muted">(Total {Math.max(executedTests.length, 1)})</span></p>
+                <div className="insight-table-wrap">
+                  <table className="insight-table compact">
+                    <thead>
+                      <tr><th>Name</th><th>Case</th><th>Total</th></tr>
+                    </thead>
+                    <tbody>
+                      {executedTests.slice(0, 3).map((t, i) => (
+                        <tr key={i}>
+                          <td>{t.name}</td>
+                          <td>{executedTests.length}</td>
+                          <td>{Math.max(executedTests.length, 1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="verification-tile">
+                <h4>Coverage Gaps</h4>
+                <p className="verification-big">{unresolvedCases} <span className="text-muted">(Critical paths, FSM transitions)</span></p>
+                <div className="insight-table-wrap">
+                  <table className="insight-table compact">
+                    <thead>
+                      <tr><th>Name</th><th>Gaps</th><th>Severity</th></tr>
+                    </thead>
+                    <tbody>
+                      {(verificationState.issues_found || []).slice(0, 3).map((issue: any, i: number) => (
+                        <tr key={i}>
+                          <td>{(issue?.type || 'Logic').toString()}</td>
+                          <td>{unresolvedCases}</td>
+                          <td>{(issue?.severity || 'medium').toString()}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="verification-tile">
+                <h4>Suggested New Tests</h4>
+                <p className="verification-big">{Math.max(suggestedTests.length, 1)} <span className="text-muted">(AI-generated)</span></p>
+                <div className="insight-table-wrap">
+                  <table className="insight-table compact">
+                    <thead>
+                      <tr><th>Tests</th><th>Priority</th></tr>
+                    </thead>
+                    <tbody>
+                      {(suggestedTests.length ? suggestedTests : ['Scenario 1: Boundary condition']).slice(0, 3).map((s: string, i: number) => (
+                        <tr key={i}>
+                          <td>{s}</td>
+                          <td>{i === 0 ? 'H' : i === 1 ? 'M' : 'L'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  const renderPage5 = () => (
+    <div className="wizard-page active slide-in">
+      <div className="header-info text-center" style={{marginBottom: '2.2rem'}}>
+        <h1>Past vs Present Comparison</h1>
+        <p>5. Compare cached previous output with latest generated output</p>
+      </div>
+
+      {!(verificationState?.current_code || latestOutputCode) ? (
+        <div className="card glass-panel text-center">
+          <h3>No Current Verification Output</h3>
+          <p className="text-muted">Run Delta Analysis first, then open this page for comparison.</p>
+        </div>
+      ) : !pastOutputCode ? (
+        <div className="card glass-panel text-center">
+          <h3>No Past Output In Browser Cache</h3>
+          <p className="text-muted">Complete another verification run to save the previous output and compare it here.</p>
+        </div>
+      ) : (
+        <div style={{display: 'grid', gap: '1rem'}}>
+          <div className="card glass-panel diff-container view-diff">
+            <div className="diff-pane">
+              <h4>Past Output (Cached)</h4>
+              <textarea className="code-editor" readOnly value={pastOutputCode} />
+            </div>
+            <div className="diff-pane">
+              <h4>Present Output (Current Run)</h4>
+              <textarea className="code-editor patch-pane" readOnly value={verificationState?.current_code || latestOutputCode || ''} />
+            </div>
+          </div>
+
+          <div className="card glass-panel">
+            <div className="card-title">Past vs Present Commit Diff</div>
+            <div className="commit-diff">
+              {pastVsPresentRows.map((row, idx) => (
+                <div key={idx} className={`diff-row diff-${row.kind}`}>
+                  <span className="diff-ln">{row.oldNo ?? ''}</span>
+                  <span className="diff-ln">{row.newNo ?? ''}</span>
+                  <span className="diff-sign">{row.kind === 'add' ? '+' : row.kind === 'del' ? '-' : ' '}</span>
+                  <span className="diff-text">{row.text || ' '}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="app-container layout-wizard">
        <nav className="wizard-stepper glass-panel">
@@ -691,6 +970,8 @@ function App() {
            <li className={step >= 1 ? 'active' : ''} onClick={() => setStep(1)}>1. Spec + Code Intake</li>
            <li className={step >= 2 ? 'active' : ''} onClick={() => setStep(2)}>2. Workflow Dashboard</li>
            <li className={step >= 3 ? 'active' : ''} onClick={() => setStep(3)}>3. Delta Analysis</li>
+           <li className={step >= 4 ? 'active' : ''} onClick={() => setStep(4)}>4. AI Insights</li>
+           <li className={step >= 5 ? 'active' : ''} onClick={() => setStep(5)}>5. Comparison</li>
          </ul>
          
          <div style={{marginTop: 'auto', display: 'flex', justifyContent: 'center'}}>
@@ -709,6 +990,8 @@ function App() {
              {step === 1 && renderPage1()}
              {step === 2 && renderPage2()}
              {step === 3 && renderPage3()}
+             {step === 4 && renderPage4()}
+             {step === 5 && renderPage5()}
           </div>
 
           <footer className="wizard-footer glass-panel">
@@ -718,13 +1001,13 @@ function App() {
              <button 
                className="btn" 
                disabled={
-                 step === 3 || 
+                step === 5 || 
                  (step === 1 && !datasheet) || 
                  (step === 1 && !verilogCode.trim())
                } 
                onClick={nextStep}
              >
-                {step === 2 ? "Open Report" : "Proceed Form"} <ArrowRight size={18} />
+               {step === 2 ? "Open Delta Analysis" : step === 3 ? "Open AI Insights" : step === 4 ? "Open Comparison" : "Proceed Form"} <ArrowRight size={18} />
              </button>
           </footer>
        </main>
