@@ -5,6 +5,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import os
+import json
 import tempfile
 import subprocess
 import shutil
@@ -17,6 +18,7 @@ from typing import Optional, List, Dict, Any
 from config import Config
 from verilog_agent import VerilogVerificationAgent
 from waveform_generator import WaveformGenerator
+from github_client import GitHubClient
 
 app = FastAPI(title="Verilog Verification API")
 
@@ -150,3 +152,98 @@ def get_image(path: str):
     if os.path.exists(path):
         return FileResponse(path)
     raise HTTPException(status_code=404, detail="Image not found")
+
+
+# ── CI Pipeline Endpoints ──────────────────────────────────────────────────────
+
+def _get_github_client():
+    """Return a GitHubClient or raise a 503 with a clear message."""
+    token = os.getenv("GITHUB_TOKEN", "")
+    repo  = os.getenv("GITHUB_REPOSITORY", "")
+    if not token or not repo:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "GitHub integration not configured. "
+                "Add GITHUB_TOKEN and GITHUB_REPOSITORY to backend/.env."
+            ),
+        )
+    try:
+        return GitHubClient(token=token)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"GitHub client error: {exc}")
+
+
+@app.post("/api/ci/submit")
+async def ci_submit(
+    spec_file: UploadFile = File(...),
+    rtl_file:  UploadFile = File(...),
+):
+    """
+    Upload spec + RTL to GitHub, trigger the Actions pipeline, and return
+    the new run_id so the frontend can poll for results.
+    """
+    gh = _get_github_client()
+
+    spec_bytes = await spec_file.read()
+    rtl_bytes  = await rtl_file.read()
+
+    spec_name = spec_file.filename or "spec.pdf"
+    rtl_name  = rtl_file.filename  or "design.v"
+
+    try:
+        run_id = gh.push_inputs(
+            spec_bytes=spec_bytes,
+            spec_filename=spec_name,
+            rtl_bytes=rtl_bytes,
+            rtl_filename=rtl_name,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to push to GitHub: {exc}")
+
+    return {"run_id": run_id, "status": "triggered"}
+
+
+@app.get("/api/ci/status/{run_id}")
+def ci_status(run_id: str):
+    """
+    Poll for CI completion. Returns ready=True along with the full report
+    once the agent has committed results to verification_runs/<run_id>/.
+    """
+    gh = _get_github_client()
+
+    report_text = gh.get_run_file(run_id, "report.json")
+    if report_text is None:
+        return {"ready": False, "run_id": run_id}
+
+    try:
+        report = json.loads(report_text)
+    except Exception:
+        report = {}
+
+    # Also fetch the fixed RTL and the markdown report for the UI
+    fixed_rtl   = gh.get_run_file(run_id, "fixed_rtl.v")     or ""
+    final_md    = gh.get_run_file(run_id, "verification_report.md") or ""
+    orig_rtl    = gh.get_run_file(run_id, "input_rtl.v")      or ""
+    risk_txt    = gh.get_run_file(run_id, "risk_summary.txt")  or ""
+
+    return {
+        "ready":        True,
+        "run_id":       run_id,
+        "report":       report,
+        "fixed_rtl":    fixed_rtl,
+        "original_rtl": orig_rtl,
+        "final_report": final_md,
+        "risk_summary": risk_txt,
+    }
+
+
+@app.get("/api/ci/runs")
+def ci_runs():
+    """List all completed CI verification runs, newest first."""
+    gh = _get_github_client()
+    try:
+        runs = gh.list_runs()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"runs": runs}

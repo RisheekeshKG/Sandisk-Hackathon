@@ -1,10 +1,10 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import type { ChangeEvent } from 'react';
 import { 
   FileText, Code2, Activity, Settings, Upload, 
   Cpu, Zap, TestTube, AlertCircle, FileDigit,
   ArrowRight, ArrowLeft, Check, X,
-  Moon, Sun
+  Moon, Sun, GitBranch, Loader, CheckCircle2
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -270,6 +270,12 @@ function App() {
   const [verifyMessage, setVerifyMessage] = useState('');
   const [llmStrictness, setLlmStrictness] = useState(8);
   const [llmLatencyProfile, setLlmLatencyProfile] = useState<'fast' | 'balanced' | 'deep'>('balanced');
+
+  // ── CI Pipeline state ─────────────────────────────────────────────────────
+  const [ciRunId, setCiRunId]     = useState<string | null>(null);
+  const [ciStatus, setCiStatus]   = useState<'idle'|'submitting'|'polling'|'done'|'error'>('idle');
+  const [ciMessage, setCiMessage] = useState('');
+  const ciPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const verilogFileInputRef = useRef<HTMLInputElement>(null);
@@ -296,6 +302,93 @@ function App() {
     setPastOutputCode(cachedPast);
     setLatestOutputCode(cachedLatest);
   }, []);
+
+  // Cleanup CI polling on unmount
+  useEffect(() => () => { if (ciPollRef.current) clearInterval(ciPollRef.current); }, []);
+
+  // ── CI poll function ────────────────────────────────────────────────────────
+  const startCiPolling = useCallback((runId: string) => {
+    if (ciPollRef.current) clearInterval(ciPollRef.current);
+    setCiStatus('polling');
+    setCiMessage(`⏳ Waiting for CI run ${runId} to complete...`);
+
+    ciPollRef.current = setInterval(async () => {
+      try {
+        const res  = await fetch(`${API_BASE}/ci/status/${runId}`);
+        const data = await parseApiResponse(res);
+
+        if (!data.ready) return; // still running — keep polling
+
+        // CI finished — stop polling
+        clearInterval(ciPollRef.current!);
+        ciPollRef.current = null;
+        setCiStatus('done');
+        setCiMessage(`✅ CI run ${runId} complete! Results loaded below.`);
+
+        // Map report.json → VerificationState shape the UI expects
+        const rpt = data.report || {};
+        const state: VerificationState = {
+          status:        rpt.status       || 'verified',
+          iteration:     rpt.iterations   || 0,
+          issues_found:  rpt.issues       || [],
+          fixes_applied: rpt.fixes_applied || [],
+          current_code:  data.fixed_rtl   || '',
+          verilog_code:  data.original_rtl || '',
+          final_report:  data.final_report || data.risk_summary || '',
+        };
+
+        const currentOutput = state.current_code.trim();
+        if (currentOutput) {
+          const prev = (localStorage.getItem(LATEST_OUTPUT_CACHE_KEY) || '').trim();
+          if (prev && prev !== currentOutput) {
+            localStorage.setItem(PAST_OUTPUT_CACHE_KEY, prev);
+            setPastOutputCode(prev);
+          }
+          localStorage.setItem(LATEST_OUTPUT_CACHE_KEY, currentOutput);
+          setLatestOutputCode(currentOutput);
+        }
+        setVerificationState(state);
+        setVerifyMessage(`✅ CI Pipeline results loaded (run ${runId}).`);
+        setStep(3); // jump to Delta Analysis page
+
+      } catch (err: any) {
+        clearInterval(ciPollRef.current!);
+        ciPollRef.current = null;
+        setCiStatus('error');
+        setCiMessage(`❌ Polling error: ${err.message}`);
+      }
+    }, 12000); // poll every 12 seconds
+  }, []);
+
+  // ── CI Submit handler ───────────────────────────────────────────────────────
+  const handleCiSubmit = async () => {
+    if (!datasheet || !verilogCode.trim()) {
+      setCiMessage('❌ Please upload both a spec file and Verilog code first.');
+      return;
+    }
+    setCiStatus('submitting');
+    setCiMessage('📤 Uploading files to GitHub...');
+    setCiRunId(null);
+
+    try {
+      const form = new FormData();
+      form.append('spec_file', datasheet);
+      // Wrap verilog string as a Blob file
+      const rtlBlob = new Blob([verilogCode], { type: 'text/plain' });
+      form.append('rtl_file', rtlBlob, verilogFileName || 'design.v');
+
+      const res  = await fetch(`${API_BASE}/ci/submit`, { method: 'POST', body: form });
+      const data = await parseApiResponse(res);
+
+      const runId = data.run_id as string;
+      setCiRunId(runId);
+      setCiMessage(`🚀 Triggered! Run ID: ${runId} — GitHub Actions pipeline is running...`);
+      startCiPolling(runId);
+    } catch (err: any) {
+      setCiStatus('error');
+      setCiMessage(`❌ Submit failed: ${err.message}`);
+    }
+  };
 
   const handleDatasheetUpload = (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
@@ -597,14 +690,83 @@ function App() {
             )}
           </div>
 
-          {/* Step D: Agent */}
+          {/* Step D: Local Agent */}
           <div className="pipeline-action glass-panel card">
-            <div className="card-title"><Zap /> Delta Analysis</div>
-            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Run AI verification against uploaded hardware spec.</p>
+            <div className="card-title"><Zap /> Delta Analysis (Local)</div>
+            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>Run AI verification locally via FastAPI backend.</p>
             <button className="btn w-full" onClick={handleVerify} disabled={isVerifying || !datasheet}>
               {isVerifying ? <><TestTube className="animate-spin" /> Iterating...</> : "Execute Delta Analysis"}
             </button>
             {verifyMessage && <div className="status-msg" style={{color: verifyMessage.includes('❌') ? 'var(--danger)' : 'var(--success)'}}>{verifyMessage}</div>}
+          </div>
+
+          {/* Step E: CI Pipeline */}
+          <div className="pipeline-action glass-panel card" style={{border: '1px solid var(--accent, #6366f1)'}}>
+            <div className="card-title" style={{color: 'var(--accent, #6366f1)'}}><GitBranch /> Submit to CI Pipeline</div>
+            <p className="text-muted" style={{marginBottom: '1rem', fontSize: '0.9rem'}}>
+              Push files to GitHub → trigger Actions → results sync back automatically.
+            </p>
+            <button
+              className="btn w-full"
+              style={{background: 'var(--accent, #6366f1)'}}
+              onClick={handleCiSubmit}
+              disabled={ciStatus === 'submitting' || ciStatus === 'polling' || !datasheet || !verilogCode.trim()}
+            >
+              {ciStatus === 'submitting' ? <><Loader size={16} className="animate-spin" /> Uploading...</>
+               : ciStatus === 'polling'   ? <><Loader size={16} className="animate-spin" /> CI Running (~3–5 min)...</>
+               : ciStatus === 'done'      ? <><CheckCircle2 size={16} /> View Results</>
+               : <><GitBranch size={16} /> 🚀 Submit to CI Pipeline</>}
+            </button>
+
+            {/* Live CI status panel */}
+            {ciStatus !== 'idle' && (
+              <div className="ci-status-panel" style={{
+                marginTop: '1rem',
+                padding: '0.75rem 1rem',
+                borderRadius: '8px',
+                background: 'var(--bg-secondary, rgba(255,255,255,0.04))',
+                fontSize: '0.85rem',
+                lineHeight: 1.6,
+              }}>
+                {ciRunId && (
+                  <div style={{display:'flex', alignItems:'center', gap:'0.5rem', marginBottom:'0.4rem'}}>
+                    <span style={{opacity:0.6}}>Run ID:</span>
+                    <code style={{color:'var(--accent,#6366f1)', fontWeight:600}}>{ciRunId}</code>
+                    <a
+                      href={`https://github.com/${import.meta.env.VITE_GITHUB_REPO || 'RisheekeshKG/Sandisk-Hackathon'}/actions`}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{fontSize:'0.78rem', color:'var(--text-muted)', textDecoration:'underline', marginLeft:'auto'}}
+                    >View on GitHub ↗</a>
+                  </div>
+                )}
+                <div style={{
+                  color: ciStatus === 'error' ? 'var(--danger)'
+                       : ciStatus === 'done'  ? 'var(--success)'
+                       : 'var(--text-muted)'
+                }}>
+                  {ciMessage}
+                </div>
+                {/* Progress steps */}
+                <div style={{display:'flex', gap:'0.5rem', marginTop:'0.75rem', flexWrap:'wrap'}}>
+                  {[
+                    {label:'Upload',   done: ciStatus !== 'idle' && ciStatus !== 'submitting'},
+                    {label:'Triggered', done: ciStatus === 'polling' || ciStatus === 'done' || ciStatus === 'error'},
+                    {label:'CI Running', done: ciStatus === 'done'},
+                    {label:'Results Ready', done: ciStatus === 'done'},
+                  ].map((s, i) => (
+                    <span key={i} style={{
+                      padding:'2px 10px',
+                      borderRadius:'999px',
+                      background: s.done ? 'var(--success)' : 'var(--bg-secondary, rgba(255,255,255,0.08))',
+                      color: s.done ? '#fff' : 'var(--text-muted)',
+                      fontSize:'0.75rem',
+                      whiteSpace:'nowrap',
+                    }}>{s.done ? '✓ ' : ''}{s.label}</span>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
