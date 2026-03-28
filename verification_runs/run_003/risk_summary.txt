@@ -1,0 +1,22 @@
+VIGIL-AI Verification Risk Summary (Sandisk Hackathon)
+Run: run_003
+Date: 2026-03-28T00:21:38.350541
+Spec: sample_sheet.pdf
+RTL : sample_design.v
+
+Overall Risk Level : HIGH
+Status             : verified
+Iterations         : 1
+Issues Found       : 3
+  CRITICAL : 2
+  HIGH     : 1
+  MEDIUM   : 0
+  LOW      : 0
+
+--- Issues ---
+1. [CRITICAL] Mismatch: The LM741 is an analog operational amplifier, designed for continuous signal processing with characteristics like gain, slew rate, input impedance, and power supply rejection. The provided Verilog code describes purely digital logic circuits (a 4-bit synchronous counter, a D flip-flop, and a combinatorial multiplexer) which operate on discrete time and binary values. There is a complete and fundamental domain mismatch between the component described in the datasheet and the functionality implemented in the Verilog code. The Verilog code does not model any aspect of an LM741.
+   Fix: Clarify the design intent. If an LM741 model is required, a different approach (e.g., Verilog-A/AMS, or a high-level behavioral model with analog concepts) is needed. If the Verilog code represents the actual intended design, then the LM741 datasheet is irrelevant, and the design should be verified against its own digital specifications.
+2. [CRITICAL] Missing functionality: As a direct consequence of the fundamental domain mismatch (Issue 1), the Verilog code completely lacks any implementation of the required behaviors for an LM741 operational amplifier. None of the key electrical/timing constraints or required behaviors identified in the datasheet analysis (e.g., high differential gain, output swing limits, specific slew rate, input impedance, common-mode rejection, offset nulling, overload protection) are present or even approximated in the digital Verilog modules.
+   Fix: If the goal is to implement an LM741, the Verilog code needs to be completely re-designed to model analog behaviors. This would typically involve using Verilog-AMS or a very high-level abstract behavioral model that approximates analog characteristics, which is beyond the scope of standard synthesizable Verilog for digital logic.
+3. [HIGH] Logic error / Best practice violation: In the `faulty_mux` module, the `always @(*)` block implements an `if (sel) out = a;` statement but lacks an `else` condition for when `sel` is `0`. In a combinatorial `always` block, if a signal is not assigned a value under all possible input conditions, synthesis tools will infer a **latch** to hold its previous value. Latches are generally undesirable in synchronous digital designs unless explicitly intended, as they can introduce asynchronous behavior, make timing analysis more complex, and potentially lead to unexpected functional issues or increased area.
+   Fix: Complete the `if-else` statement to ensure `out` is assigned a value for all possible input combinations of `sel`. For a standard 2-to-1 multiplexer, the fix would be:
